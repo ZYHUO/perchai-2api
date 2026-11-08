@@ -38,7 +38,7 @@ async function fixture(t, handler, overrides = {}) {
     });
   });
   const appUrl = await listen(upstream);
-  const proxy = buildApp({ ...readEnv(), appUrl, defaultToken: "test-token", clientKey: "test-key", accounts: [], logLevel: 0, connectTimeoutMs: 1000, totalTimeoutMs: 2000, idleTimeoutMs: 1000, ...overrides });
+  const proxy = buildApp({ ...readEnv(), backend: "http", appUrl, defaultToken: "test-token", clientKey: "test-key", accounts: [], logLevel: 0, connectTimeoutMs: 1000, totalTimeoutMs: 2000, idleTimeoutMs: 1000, ...overrides });
   const url = await listen(proxy);
   t.after(async () => { await stop(proxy); await stop(upstream); });
   return { appUrl, url, proxy, upstream };

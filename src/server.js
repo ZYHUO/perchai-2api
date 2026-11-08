@@ -5,6 +5,7 @@ const http = require("node:http");
 const { readEnv } = require("./config");
 const { Account, setMaxSockets } = require("./session");
 const { modelCall, embeddings, usageMeter, defaultModel } = require("./perch");
+const { CLI_MODELS, prepareCliRequest, runCliChat } = require("./cli");
 const { FixedWindowRateLimit } = require("./limiter");
 const { log, readJsonBody, readStream, now, randomId } = require("./util");
 const { openAIError, toChatCompletion, parsePerchLine, upstreamError, normalizeUsage, finishReasonOf } = require("./translate");
@@ -147,14 +148,29 @@ function buildApp(cfg) {
     let attempt;
     try {
       try {
+        if (cfg.backend === "cli") {
+          const prepared = prepareCliRequest(body);
+          const data = await runCliChat(account, prepared, { cfg, signal: ac.signal });
+          if (res.destroyed) return;
+          const out = toChatCompletion(data, prepared.model);
+          requestLog(req, res, { account, model: out.model, tokens: out.usage?.total_tokens, durationMs: Date.now() - startMs, status: 200 });
+          if (stream) return sendCliStream(res, out, body.stream_options?.include_usage === true);
+          return sendJSON(res, 200, out);
+        }
         attempt = await modelCall(account, body, { stream, signal: ac.signal, cfg });
       } catch (e) {
         if (ac.signal.aborted || res.destroyed) {
           // client went away or timed out; nothing to write
           return;
         }
-        requestLog(req, res, { account, model: modelName, durationMs: Date.now() - startMs, status: 502 });
-        return sendJSON(res, 502, openAIError(502, e.message || "Upstream request failed", "upstream_error"));
+        const status = Number.isInteger(e.status) && e.status >= 400 && e.status <= 599 ? e.status : 502;
+        if (e.retryAfter) res.setHeader("Retry-After", e.retryAfter);
+        requestLog(req, res, { account, model: modelName, durationMs: Date.now() - startMs, status });
+        return sendJSON(res, status, openAIError(status, e.message || "Upstream request failed", e.code || "upstream_error", {
+          ...(e.stage ? { stage: e.stage } : {}),
+          ...(e.param ? { param: e.param } : {}),
+          ...(e.upstreamStatus ? { upstream_status: e.upstreamStatus } : {}),
+        }));
       }
       if (!attempt.auth) {
         requestLog(req, res, { account, model: modelName, durationMs: Date.now() - startMs, status: 401 });
@@ -185,6 +201,18 @@ function buildApp(cfg) {
       attempt?.release?.();
       res.off("close", onClientClose);
     }
+  }
+
+  // The official CLI emits JSON when its task finishes. SSE here preserves the
+  // client wire format, but the content is buffered, not incremental tokens.
+  function sendCliStream(res, completion, includeUsage) {
+    res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Perch-Stream-Mode": "buffered" });
+    const base = { id: completion.id, object: "chat.completion.chunk", created: completion.created, model: completion.model };
+    const write = (data) => res.write(`data: ${JSON.stringify({ ...base, ...data })}\n\n`);
+    write({ choices: [{ index: 0, delta: { role: "assistant", content: completion.choices[0].message.content }, finish_reason: null }] });
+    write({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+    if (includeUsage && completion.usage) write({ choices: [], usage: completion.usage });
+    res.end("data: [DONE]\n\n");
   }
 
   // non-streaming
@@ -356,6 +384,8 @@ function buildApp(cfg) {
 
   // ---- /v1/embeddings -------------------------------------------------------
   async function handleEmbeddings(req, res, { key, account }, startMs) {
+    if (!account) return sendJSON(res, 401, openAIError(401, "Invalid API key", "invalid_api_key"));
+    if (cfg.backend === "cli") return sendJSON(res, 501, openAIError(501, "The CLI backend does not expose embeddings", "unsupported_endpoint"));
     let body;
     try {
       body = await readJsonBody(req, { limit: cfg.maxBodyBytes });
@@ -406,6 +436,10 @@ function buildApp(cfg) {
 
   // ---- /v1/models -------------------------------------------------------------
   async function handleModels(req, res, { key, account }, startMs) {
+    if (cfg.backend === "cli") return sendJSON(res, 200, {
+      object: "list",
+      data: CLI_MODELS.map((id) => ({ id, object: "model", created: 0, owned_by: "perch-ai", ...(id === "auto" ? { default: true } : {}) })),
+    });
     const acc = account || defaultAccount;
     const def = acc && acc.configured ? await defaultModel(acc, { cfg }).catch(() => null) : null;
     const models = [...HOSTED_MODELS];
@@ -428,6 +462,7 @@ function buildApp(cfg) {
   // ---- /v1/usage ---------------------------------------------------------------
   async function handleUsage(req, res, { key, account }, startMs) {
     if (!account) return sendJSON(res, 401, openAIError(401, "Invalid API key", "invalid_api_key"));
+    if (cfg.backend === "cli") return sendJSON(res, 501, openAIError(501, "Use /usage in the official Perch CLI for account usage", "unsupported_endpoint"));
     try {
       const { res: up, json } = await usageMeter(account, { cfg });
       if (up.statusCode >= 400) {
@@ -455,12 +490,14 @@ function buildApp(cfg) {
       return sendJSON(res, 200, {
         ok: true,
         service: "perchai-2api",
+        backend: cfg.backend || "http",
+        ...(cfg.backend === "cli" ? { capabilities: { textChat: true, stream: "buffered", tools: false, embeddings: false, accountUsage: false } } : {}),
         uptimeSec: Math.round(process.uptime()),
         ...(account ? { accounts: [{
           label: account.label,
           configured: !!account.session?.accessToken,
-          activeRequests: account.semaphore?.active ?? 0,
-          concurrencyDepth: account.semaphore?.depth ?? 0,
+          activeRequests: (cfg.backend === "cli" ? account.cliSemaphore : account.semaphore)?.active ?? 0,
+          concurrencyDepth: (cfg.backend === "cli" ? account.cliSemaphore : account.semaphore)?.depth ?? 0,
         }] } : {}),
       });
     }
@@ -509,12 +546,14 @@ function startServer(cfg = null) {
   server.listen(config.port, config.host, () => {
     log("info", `perchai-2api listening on http://${config.host}:${config.port}`);
     log("info", `backend: ${config.appUrl}`);
+    log("info", `transport: ${config.backend || "http"}${config.backend === "cli" ? " (text tasks, buffered SSE)" : ""}`);
     if (config.accounts.length) {
       log("info", `multi-account mode: ${config.accounts.length} client keys configured`);
     } else {
       log("info", `default account: ${config.defaultToken ? "PERCH_MODEL_CALL_PROXY_TOKEN" : config.defaultSessionPath}`);
     }
-    log("info", `concurrency: ${config.maxConcurrency}${config.rpm ? `, rate limit: ${config.rpm} rpm/key` : ""}`);
+    const concurrency = config.backend === "cli" ? config.cliMaxConcurrency : config.maxConcurrency;
+    log("info", `concurrency: ${concurrency}${config.rpm ? `, rate limit: ${config.rpm} rpm/key` : ""}`);
   });
   server.on("error", (e) => {
     console.error(e);

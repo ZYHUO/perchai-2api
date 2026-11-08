@@ -1,9 +1,37 @@
 # perchai-2api
 
-把 Perch AI（[`perchai-cli`](https://www.npmjs.com/package/perchai-cli)）的托管模型网关反代成 **OpenAI 兼容的 2api** 服务。
-逆向自 `perchai-cli@2.4.125`，**零运行时依赖**（纯 Node 18+ 内置模块），支持流式、工具调用、多账户、内置 OAuth 登录。
+为 Perch AI 提供 OpenAI 风格的本地聊天接口，包含两种后端：
 
-## 特性
+- **CLI 后端**：Docker Compose 默认使用它，实际运行未修改的 `perchai-cli@2.4.125 run --json`。支持文本会话和任务完成后的 SSE 格式返回；详细限制见下节。
+- **HTTP 后端**：原有内部模型网关适配，纯 Node 18+ 内置模块。是否能够调用取决于上游访问权限；收到 `perch_surface_required` 时会停止，不会切换身份或自动改走 CLI。
+
+CLI 后端需要 Node 22+ 和官方 CLI 的依赖，镜像会安装固定版本。接入依据是官方支持脚本调用的 [one-shot CLI 接口](https://www.perchai.app/docs/using-perch/cli)。请按账号获准的用途使用；CLI 可用不代表拥有直接 API、转售或对外共享授权。
+
+## CLI 后端的能力和限制
+
+使用下方 Docker Compose 步骤部署后，Base URL 为 `http://127.0.0.1:8080/v1`，Key 使用 `.env` 中的 `PERCH_2API_KEY`。客户端模型先选择 `auto` 或 `standard`。
+
+| 能力 | CLI 后端行为 |
+|---|---|
+| 文本聊天 | 支持 string 和 text 内容块；每次请求使用独立工作目录与本地线程状态 |
+| 多轮上下文 | 将 `messages` 序列化为 CLI 的一次任务输入；角色标签作为上下文，不保证原生模型 API 的指令优先级 |
+| `stream:true` | 任务完成后返回 SSE，一次发送完整文本；响应头 `X-Perch-Stream-Mode: buffered`，并非逐 token 输出 |
+| `stream_options.include_usage` | 返回 CLI 报告的本轮总用量，含 Perch 自带上下文；可包含缓存 token |
+| 模型选择 | `/v1/models` 列出 `auto`、`standard`、`standard max`、`pro`、`pro max`；具体模型名称由官方 CLI 和账号权限决定 |
+| `reasoning_effort` | 映射到 CLI 的 `--effort`，`none` 对应 `off` |
+| 工具、图片、JSON schema、采样参数和输出 token 上限 | 不支持；参数出现时返回 400 `unsupported_parameter`，不会静默忽略 |
+| `/v1/embeddings`、`/v1/usage` | 返回 501；账号用量请使用官方 CLI 的 `/usage` |
+| 取消和超时 | 断开客户端会终止 CLI；默认 120 秒超时，每账号默认 1 个并发任务 |
+
+使用 CLI 后端时，关闭客户端的工具调用，并删除请求中的 `max_tokens`、`max_completion_tokens`、`temperature`、`top_p`、`response_format` 等不受支持的字段。发送的最小请求是：
+
+```json
+{"model":"auto","messages":[{"role":"user","content":"你好"}]}
+```
+
+本地工具被 `--no-local-tools` 关闭，权限模式固定为 `plan`；临时工作目录在请求结束后删除。官方 CLI 自身的账号记忆、提示词和远端任务记录仍由 Perch 管理，此适配不是无状态的原始模型端点。多账户模式要求每个账号使用独立目录中的 `cli-auth-session.json`；CLI 后端不支持仅传 `PERCH_MODEL_CALL_PROXY_TOKEN`。
+
+## HTTP 后端特性
 
 - **OpenAI 兼容**：`/v1/chat/completions`（流式/非流式）、`/v1/models`、`/v1/embeddings`、`/v1/usage`，Cherry Studio / NextChat / one-api / new-api / curl 直接可用
 - **内置登录**：`perchai-2api login` 自带 PKCE OAuth 流程，不需要装官方 CLI
@@ -11,13 +39,15 @@
 - **连接复用**：keep-alive 连接池，避免每次请求重新 TLS 握手
 - **流式健壮性**：背压感知（drain）、客户端断开即中止上游、空闲超时、总超时
 - **自动重试**：上游 401 → 刷新会话重试一次；408/425/502/503 → 退避重试一次
-- **turn-ticket**：自动获取并续期 Perch 计量票据（`x-perch-turn-ticket`），失败降级不阻塞
+- **turn-ticket**：自动获取并续期 Perch 计量票据，失败立即停止；保留上游状态、错误码和 `stage: turn_ticket`，限流时返回 `Retry-After`
 - **多账户**：`PERCH_ACCOUNTS` 把不同 API key 映射到不同 Perch 账号，共用一套服务
 - **限流**：`PERCH_RPM` 按 key 限速（固定窗口），返回 429 + Retry-After
 - **会话自愈**：复用官方 CLI 的 `~/.perch/cli-auth-session.json`，自动 refresh token
 - **日志**：每请求一行（状态/耗时/模型/tokens/账户），`PERCH_LOG_LEVEL` 控制
 
-## 快速开始
+## HTTP 后端快速开始
+
+以下为 HTTP 模式，需要上游允许该调用方式。CLI 模式使用文末的 Docker Compose 部署步骤。
 
 ```bash
 # 方式 A：内置登录（推荐）
@@ -48,6 +78,10 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
+| `PERCH_BACKEND` | 源码 `http` / CLI 镜像 `cli` | 显式选择后端，不因请求被拒绝而自动切换 |
+| `PERCH_CLI_ENTRY` | `/opt/perchai-cli/node_modules/perchai-cli/dist/perch.mjs` | 官方 CLI 入口 |
+| `PERCH_CLI_TIMEOUT_MS` | `120000` | CLI 任务超时 |
+| `PERCH_CLI_MAX_CONCURRENCY` | `1` | 每账号 CLI 并发上限 |
 | `PORT` / `HOST` | `8080` / `0.0.0.0` | 监听地址 |
 | `PERCH_APP_URL` | `https://app.perchai.app` | Perch 后端地址 |
 | `PERCH_MODEL_CALL_PROXY_TOKEN` | — | 直接用 access token 代替会话文件 |
@@ -61,7 +95,7 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 | `PERCH_TOTAL_TIMEOUT_MS` | `1800000` | 每次上游模型调用超时（含流式响应体） |
 | `PERCH_LOG_LEVEL` | `1` | `0`=安静 `1`=请求日志 `2`=调试 |
 
-## 端点
+## HTTP 后端端点
 
 | 端点 | 说明 |
 |---|---|
@@ -71,7 +105,7 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 | `GET /v1/usage` | Perch 用量透传 |
 | `GET /healthz` | 健康检查（含账户/会话/队列状态） |
 
-## 常用模型
+## HTTP 后端候选模型
 
 Perch 托管：`gpt-6.1-sol`、`gpt-6.1-terra`、`gpt-6-astra`、`gpt-6-sol`、`gpt-6-luna`、`gpt-5-6-*`、`gpt-5.5`、`deepseek-v4-flash-0731`、`fw-kimi-k3`、`fw-glm-5-3`、`grok-4.7`
 
@@ -94,16 +128,16 @@ Perch 托管：`gpt-6.1-sol`、`gpt-6.1-terra`、`gpt-6-astra`、`gpt-6-sol`、`
 ## 测试
 
 ```bash
-npm test     # 35 个用例：mock 上游端到端、登录、超时、取消、流式、并发与鉴权回归
+npm test     # 50 个用例：HTTP、票据拒绝、CLI 子进程、取消、超时及兼容性回归
 ```
 
 ## Docker
 
 ```bash
-docker build -t perchai-2api .
-docker run -d -p 8080:8080 \
-  -v $HOME/.perch:/root/.perch \
-  perchai-2api
+# CLI 镜像（Compose 默认目标）
+docker build --target cli -t perchai-2api:local .
+# 仅 HTTP 的轻量镜像
+docker build --target runtime -t perchai-2api:http .
 ```
 
 ## 项目结构
@@ -113,6 +147,7 @@ bin/perchai-2api.js    CLI 入口（serve / login / status）
 src/
   server.js            路由、流式管道、背压、日志、多账户解析
   perch.js             上游调用（信号量、重试、会话刷新）
+  cli.js               官方 CLI 子进程、文本适配、参数校验、取消与超时
   session.js           会话加载/刷新、turn-ticket、keep-alive 连接池
   login.js             内置 PKCE OAuth 登录
   translate.js         OpenAI ⇄ Perch 协议翻译、SSE 状态机
@@ -126,7 +161,7 @@ test/
 ## 说明
 
 - 会话过期自动刷新；上游 401 自动重试一次（与官方 CLI 行为一致）。
-- turn-ticket 获取失败时降级为不带票据调用，不阻塞请求。
+- turn-ticket 失败不会继续发模型请求；403 在本进程内短暂缓存 30 秒，429 尊重 `Retry-After`，避免持续重复被拒绝的请求。
 - 仅供个人使用，未内置 TLS；公网部署请自行加反向代理与访问控制。
 - 本项目只包装你自己的 Perch 账号，不涉及任何第三方账户凭证的绕过。
 
@@ -149,7 +184,7 @@ docker-compose up -d --build
 - 容器：`perchai-2api`，`restart: unless-stopped`，非 root 用户运行。
 - 客户端密钥保存在 `.env` 的 `PERCH_2API_KEY`，文件权限为 `600`。不要将该文件提交到版本库。
 - 会话目录：`data/`，容器内为 `/data`；会话文件为 `data/cli-auth-session.json`。
-- 已设置每分钟 60 次聊天请求、每账号 4 个上游并发，以及日志轮转。
+- 已设置每分钟 60 次聊天请求、CLI 每账号 1 个并发，以及日志轮转；HTTP 后端的并发配置独立。
 - `/healthz` 表示服务进程存活。带正确 API Key 请求时才返回当前账号会话及队列状态；进程健康不代表已经登录。
 
 管理命令（在项目目录执行）：
@@ -183,10 +218,10 @@ docker-compose restart
 5. 用量和向量接口首次请求未加载会话；模型列表未校验客户端密钥；健康检查泄露账号路径；多账号启动日志包含完整 API Key。
 6. 并发信号量交接存在超额并发窗口；相同会话的多个 Key 未共享并发限制；新 turn-ticket 的 runId 未用于首次模型请求。
 
-35 个测试使用本地 mock 上游，涵盖正常聊天、SSE、工具调用、错误、取消、超时、并发、登录换码、账号路由和鉴权。可复现命令：
+50 个测试使用本地 mock 上游和 CLI 子进程夹具，涵盖正常聊天、SSE、工具调用、票据拒绝、错误、取消、超时、并发、登录换码、账号路由和鉴权。可复现命令：
 
 ```bash
 docker run --rm -v "$PWD:/app:ro" -w /app node:22-alpine npm test
 ```
 
-这组测试没有使用真实 Perch 账号。部署后需要登录并验证真实账号的聊天、工具、向量、用量和令牌刷新。`/v1/models` 的候选列表为代码内置列表，不代表账号有权使用全部模型。流式工具参数按 Perch 快照处理，在工具封口或完成事件时输出；上游协议变化仍需要真实账号验证。
+自动测试不需要真实 Perch 账号。HTTP 模式的候选模型列表不代表账号有权使用全部模型；流式工具参数按 Perch 快照处理，在工具封口或完成事件时输出。CLI 模式的支持范围以上方能力表为准，不能用 HTTP 模式的测试结果推断 CLI 支持工具或向量。

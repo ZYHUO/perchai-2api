@@ -2,7 +2,9 @@ version: "3.8"
 
 services:
   perchai-2api:
-    build: .
+    build:
+      context: .
+      target: cli
     image: perchai-2api:local
     container_name: perchai-2api
     restart: unless-stopped
@@ -20,7 +22,8 @@ services:
       - ./data:/data
     read_only: true
     tmpfs:
-      - /tmp:size=16m,mode=1777
+      - /tmp:size=128m,mode=1777
+      - /home/node:size=64m,mode=700,uid=1000,gid=1000
     cap_drop:
       - ALL
     security_opt:

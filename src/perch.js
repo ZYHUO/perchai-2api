@@ -40,7 +40,13 @@ function makePerchBody(openAIRequest, runId) {
 // Single model-call attempt; returns the raw upstream response (stream).
 async function attemptModelCall(account, perchBody, { stream, signal, cfg }) {
   if (!(await account.ensureSession())) return { auth: false };
-  const ticketHeaders = await account.turnTicketHeaders({ timeoutMs: cfg.ticketTimeoutMs });
+  let ticketHeaders;
+  try {
+    ticketHeaders = await account.turnTicketHeaders({ timeoutMs: cfg.ticketTimeoutMs });
+  } catch (error) {
+    if (error.status !== 401 || !(await account.ensureSession(true))) throw error;
+    ticketHeaders = await account.turnTicketHeaders({ timeoutMs: cfg.ticketTimeoutMs });
+  }
   perchBody.runId = account.ticketRunId || perchBody.runId;
   const headers = {
     "Content-Type": "application/json",
@@ -168,7 +174,7 @@ async function defaultModel(account, { signal = null, cfg } = {}) {
   if (res.statusCode !== 200 || !json || json.ok !== true) return null;
   const sel = json.selection;
   if (typeof sel === "string") return sel;
-  return sel?.modelId || sel?.id || null;
+  return sel?.chatModelId || sel?.modelId || sel?.id || null;
 }
 
 module.exports = { modelCall, embeddings, usageMeter, defaultModel, makePerchBody, randomId };

@@ -26,6 +26,10 @@ function readEnv() {
   }
 
   const cfg = {
+    backend: process.env.PERCH_BACKEND || "http",
+    cliEntry: process.env.PERCH_CLI_ENTRY || "/opt/perchai-cli/node_modules/perchai-cli/dist/perch.mjs",
+    cliTimeoutMs: Number(process.env.PERCH_CLI_TIMEOUT_MS || 120_000),
+    cliMaxConcurrency: Number(process.env.PERCH_CLI_MAX_CONCURRENCY || 1),
     appUrl,
     port: Number(process.env.PORT || 8080),
     host: process.env.HOST || "0.0.0.0",
@@ -48,6 +52,9 @@ function readEnv() {
     userAgent: `perchai-cli/${process.env.PERCH_CLI_VERSION || "2.4.125"} (perchai-2api)`,
     logLevel: Number(process.env.PERCH_LOG_LEVEL || 1), // 0=quiet 1=info 2=debug
   };
+  if (!["http", "cli"].includes(cfg.backend)) throw new Error("PERCH_BACKEND must be http or cli");
+  if (!Number.isSafeInteger(cfg.cliTimeoutMs) || cfg.cliTimeoutMs < 1) throw new Error("PERCH_CLI_TIMEOUT_MS must be a positive integer");
+  if (!Number.isSafeInteger(cfg.cliMaxConcurrency) || cfg.cliMaxConcurrency < 1) throw new Error("PERCH_CLI_MAX_CONCURRENCY must be a positive integer");
   return cfg;
 }
 

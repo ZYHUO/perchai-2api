@@ -7,6 +7,18 @@ const https = require("node:https");
 const fs = require("node:fs");
 const { log, now } = require("./util");
 
+class TurnTicketError extends Error {
+  constructor(message, { status = 502, code = "turn_ticket_unavailable", upstreamStatus = null, retryAfter = null } = {}) {
+    super(message);
+    this.name = "TurnTicketError";
+    this.status = status;
+    this.code = code;
+    this.upstreamStatus = upstreamStatus;
+    this.retryAfter = retryAfter;
+    this.stage = "turn_ticket";
+  }
+}
+
 // ---------------------------------------------------------------- upstream client
 
 const agents = {
@@ -125,6 +137,7 @@ class Account {
     this.authConfig = null;
     this.ticket = null;
     this.ticketPromise = null;
+    this.ticketFailure = null;
     this.refreshing = null;
     this.label = token ? "env-token" : sessionPath;
     if (token) {
@@ -234,25 +247,29 @@ class Account {
       : {};
   }
 
-  // Turn ticket: best-effort, cached, auto-renewed. Returns headers or {}.
+  // A rejected or missing ticket must never fall through to a model call.
   async turnTicketHeaders({ timeoutMs = 8000 } = {}) {
-    try {
-      if (this.ticket && this.ticket.expiresAt > Date.now() + 30_000) {
-        return { "x-perch-turn-ticket": this.ticket.token };
-      }
-      if (this.ticket && this.ticket.expiresAt > Date.now() && this.ticket.renewal && !this.ticketPromise) {
-        this.ticketPromise = this.fetchTicket(this.ticket.renewal, { timeoutMs }).then((t) => (this.ticket = t)).catch(() => null).finally(() => (this.ticketPromise = null));
-        return { "x-perch-turn-ticket": this.ticket.token };
-      }
-      if (!this.ticketPromise) {
-        this.ticketPromise = this.fetchTicket(null, { timeoutMs }).then((t) => (this.ticket = t)).finally(() => (this.ticketPromise = null));
-      }
-      await this.ticketPromise;
-      if (!this.ticket || this.ticket.expiresAt <= Date.now() + 30_000) return {};
+    if (this.ticketFailure?.until > Date.now()) throw this.ticketFailure.error;
+    if (this.ticket && this.ticket.expiresAt > Date.now() + 30_000) {
       return { "x-perch-turn-ticket": this.ticket.token };
-    } catch {
-      return {};
     }
+    if (!this.ticketPromise) {
+      const renewal = this.ticket?.expiresAt > Date.now() ? this.ticket.renewal : null;
+      this.ticketPromise = this.fetchTicket(renewal, { timeoutMs })
+        .then((ticket) => { this.ticketFailure = null; return (this.ticket = ticket); })
+        .catch((cause) => {
+          this.ticket = null;
+          const error = cause instanceof TurnTicketError ? cause : new TurnTicketError("Could not obtain a Perch turn ticket");
+          if (error.status === 403 || error.status === 429) {
+            const cooldown = error.retryAfter ? error.retryAfter * 1000 : error.status === 403 ? 30_000 : 1000;
+            this.ticketFailure = { error, until: Date.now() + cooldown };
+          }
+          throw error;
+        })
+        .finally(() => { this.ticketPromise = null; });
+    }
+    const ticket = await this.ticketPromise;
+    return { "x-perch-turn-ticket": ticket.token };
   }
 
   async fetchTicket(renewal = null, { timeoutMs = 8000 } = {}) {
@@ -269,10 +286,19 @@ class Account {
       connectTimeoutMs: timeoutMs,
       totalTimeoutMs: timeoutMs,
     });
-    if (res.statusCode >= 400) { res.destroy(); return null; }
-    const d = await readResBody(res);
-    if (!d?.ok || !d.ticket || !d.ticketId || !d.runId) return null;
+    const d = await readResBody(res, { limit: 1024 * 1024 });
+    if (res.statusCode >= 400 || d?.ok !== true) {
+      const seconds = Number(res.headers["retry-after"]);
+      throw new TurnTicketError(typeof d?.error === "string" ? d.error.slice(0, 1000) : "Perch rejected the turn ticket request", {
+        status: res.statusCode >= 400 && res.statusCode < 500 ? res.statusCode : 502,
+        code: typeof d?.errorCode === "string" ? d.errorCode : "turn_ticket_unavailable",
+        upstreamStatus: res.statusCode,
+        retryAfter: Number.isFinite(seconds) && seconds > 0 ? Math.min(86400, Math.ceil(seconds)) : null,
+      });
+    }
+    if (!d.ticket || !d.ticketId || !d.runId) throw new TurnTicketError("Perch returned an incomplete turn ticket");
     const expiresAt = d.expiresAt ? Date.parse(d.expiresAt) : Date.now() + 300_000;
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) throw new TurnTicketError("Perch returned an invalid or expired turn ticket");
     return {
       token: d.ticket,
       ticketId: d.ticketId,
@@ -288,4 +314,4 @@ class Account {
   }
 }
 
-module.exports = { Account, rawRequest, upstreamJson, readResBody, setMaxSockets, agents };
+module.exports = { Account, TurnTicketError, rawRequest, upstreamJson, readResBody, setMaxSockets, agents };
