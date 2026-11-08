@@ -1,4 +1,4 @@
-FROM node:22-alpine AS runtime
+FROM node:22-alpine AS base
 
 WORKDIR /app
 
@@ -13,10 +13,15 @@ EXPOSE 8080
 
 CMD ["node", "bin/perchai-2api.js", "serve"]
 
-FROM runtime AS cli
+FROM base AS cli
 
 ARG PERCH_CLI_PACKAGE_VERSION=2.4.125
 RUN npm install --prefix /opt/perchai-cli --omit=dev --ignore-scripts --no-audit --no-fund perchai-cli@${PERCH_CLI_PACKAGE_VERSION}
 
 ENV PERCH_BACKEND=cli \
     PERCH_CLI_ENTRY=/opt/perchai-cli/node_modules/perchai-cli/dist/perch.mjs
+
+# Plain docker build and Compose both use the original HTTP transport.
+FROM base AS runtime
+
+ENV PERCH_BACKEND=http

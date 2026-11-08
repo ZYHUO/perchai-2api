@@ -4,7 +4,7 @@ services:
   perchai-2api:
     build:
       context: .
-      target: cli
+      target: runtime
     image: perchai-2api:local
     container_name: perchai-2api
     restart: unless-stopped
@@ -17,13 +17,13 @@ services:
       NODE_ENV: production
       HOST: "0.0.0.0"
       PORT: "8080"
+      PERCH_BACKEND: http
       PERCH_CLI_AUTH_DIR: /data
     volumes:
       - ./data:/data
     read_only: true
     tmpfs:
-      - /tmp:size=128m,mode=1777
-      - /home/node:size=64m,mode=700,uid=1000,gid=1000
+      - /tmp:size=16m,mode=1777
     cap_drop:
       - ALL
     security_opt:

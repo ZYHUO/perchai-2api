@@ -2,14 +2,14 @@
 
 为 Perch AI 提供 OpenAI 风格的本地聊天接口，包含两种后端：
 
-- **CLI 后端**：Docker Compose 默认使用它，实际运行未修改的 `perchai-cli@2.4.125 run --json`。支持文本会话和任务完成后的 SSE 格式返回；详细限制见下节。
-- **HTTP 后端**：原有内部模型网关适配，纯 Node 18+ 内置模块。是否能够调用取决于上游访问权限；收到 `perch_surface_required` 时会停止，不会切换身份或自动改走 CLI。
+- **HTTP 后端（默认）**：原有内部模型网关适配，纯 Node 18+ 内置模块。源码、默认 Docker 镜像和 Docker Compose 均使用它，不启动官方 CLI。是否能够调用取决于上游访问权限；收到 `perch_surface_required` 时会停止，不会自动切换后端。
+- **CLI 后端（可选，默认不启用）**：实际运行未修改的 `perchai-cli@2.4.125 run --json`。支持文本会话和任务完成后的 SSE 格式返回；详细限制见下节。
 
-CLI 后端需要 Node 22+ 和官方 CLI 的依赖，镜像会安装固定版本。接入依据是官方支持脚本调用的 [one-shot CLI 接口](https://www.perchai.app/docs/using-perch/cli)。请按账号获准的用途使用；CLI 可用不代表拥有直接 API、转售或对外共享授权。
+CLI 后端需要 Node 22+ 和官方 CLI 的依赖，只有 `cli` 构建目标会安装固定版本。接入依据是官方支持脚本调用的 [one-shot CLI 接口](https://www.perchai.app/docs/using-perch/cli)。请按账号获准的用途使用；CLI 可用不代表拥有直接 API、转售或对外共享授权。
 
 ## CLI 后端的能力和限制
 
-使用下方 Docker Compose 步骤部署后，Base URL 为 `http://127.0.0.1:8080/v1`，Key 使用 `.env` 中的 `PERCH_2API_KEY`。客户端模型先选择 `auto` 或 `standard`。
+本节仅适用于显式构建并启用的 CLI 后端，默认部署不使用此模式。该模式下客户端模型先选择 `auto` 或 `standard`；不能将这些档位名当作 HTTP 后端的模型 ID。
 
 | 能力 | CLI 后端行为 |
 |---|---|
@@ -47,7 +47,7 @@ CLI 后端需要 Node 22+ 和官方 CLI 的依赖，镜像会安装固定版本�
 
 ## HTTP 后端快速开始
 
-以下为 HTTP 模式，需要上游允许该调用方式。CLI 模式使用文末的 Docker Compose 部署步骤。
+以下为 HTTP 模式，需要上游允许该调用方式。文末的 Docker Compose 部署步骤也默认使用 HTTP 模式。
 
 ```bash
 # 方式 A：内置登录（推荐）
@@ -78,7 +78,7 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `PERCH_BACKEND` | 源码 `http` / CLI 镜像 `cli` | 显式选择后端，不因请求被拒绝而自动切换 |
+| `PERCH_BACKEND` | `http`（可选 CLI 镜像为 `cli`） | 默认 Compose 显式固定为 `http`，不因请求被拒绝而自动切换 |
 | `PERCH_CLI_ENTRY` | `/opt/perchai-cli/node_modules/perchai-cli/dist/perch.mjs` | 官方 CLI 入口 |
 | `PERCH_CLI_TIMEOUT_MS` | `120000` | CLI 任务超时 |
 | `PERCH_CLI_MAX_CONCURRENCY` | `1` | 每账号 CLI 并发上限 |
@@ -134,10 +134,10 @@ npm test     # 50 个用例：HTTP、票据拒绝、CLI 子进程、取消、超
 ## Docker
 
 ```bash
-# CLI 镜像（Compose 默认目标）
-docker build --target cli -t perchai-2api:local .
-# 仅 HTTP 的轻量镜像
-docker build --target runtime -t perchai-2api:http .
+# HTTP 轻量镜像（默认目标，Compose 同样使用 runtime）
+docker build --target runtime -t perchai-2api:local .
+# 可选 CLI 镜像，不用于默认部署
+docker build --target cli -t perchai-2api:cli .
 ```
 
 ## 项目结构
@@ -184,7 +184,7 @@ docker-compose up -d --build
 - 容器：`perchai-2api`，`restart: unless-stopped`，非 root 用户运行。
 - 客户端密钥保存在 `.env` 的 `PERCH_2API_KEY`，文件权限为 `600`。不要将该文件提交到版本库。
 - 会话目录：`data/`，容器内为 `/data`；会话文件为 `data/cli-auth-session.json`。
-- 已设置每分钟 60 次聊天请求、CLI 每账号 1 个并发，以及日志轮转；HTTP 后端的并发配置独立。
+- 默认 HTTP 部署已设置每分钟 60 次聊天请求、每账号 4 个上游并发，以及日志轮转。
 - `/healthz` 表示服务进程存活。带正确 API Key 请求时才返回当前账号会话及队列状态；进程健康不代表已经登录。
 
 管理命令（在项目目录执行）：
