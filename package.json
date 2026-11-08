@@ -1,0 +1,35 @@
+{
+  "name": "perchai-2api",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible 2api proxy for Perch AI (perchai-cli) — reverse-engineered model-call gateway, zero runtime dependencies",
+  "license": "MIT",
+  "bin": {
+    "perchai-2api": "bin/perchai-2api.js"
+  },
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node bin/perchai-2api.js serve",
+    "serve": "node bin/perchai-2api.js serve",
+    "login": "node bin/perchai-2api.js login",
+    "status": "node bin/perchai-2api.js status",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "perchai",
+    "perch-ai",
+    "2api",
+    "openai",
+    "proxy",
+    "chat-completions",
+    "reverse-engineered"
+  ],
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ]
+}
