@@ -32,7 +32,7 @@ const escapeHtml = (s) =>
   String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 // Start a local callback server; resolves with { server, codePromise }.
-function startCallbackServer({ host = "127.0.0.1", timeoutMs = 180_000 } = {}) {
+function startCallbackServer({ host = "127.0.0.1", port = 0, timeoutMs = 180_000 } = {}) {
   let done = false;
   let resolveCode, rejectCode;
   const codePromise = new Promise((resolve, reject) => {
@@ -41,6 +41,11 @@ function startCallbackServer({ host = "127.0.0.1", timeoutMs = 180_000 } = {}) {
   });
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, `http://${host}`);
+    if (req.method !== "GET" || url.pathname !== "/callback") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
     const code = url.searchParams.get("code");
     const err = url.searchParams.get("error_description") || url.searchParams.get("error");
     if (done) {
@@ -69,7 +74,7 @@ function startCallbackServer({ host = "127.0.0.1", timeoutMs = 180_000 } = {}) {
   });
   return new Promise((resolve, reject) => {
     server.on("error", reject);
-    server.listen(0, host, () => {
+    server.listen(port, host, () => {
       const port = server.address().port;
       server.off("error", reject);
       setTimeout(() => {
@@ -85,9 +90,9 @@ function startCallbackServer({ host = "127.0.0.1", timeoutMs = 180_000 } = {}) {
   });
 }
 
-async function login({ appUrl, provider = null, outPath = null, host = "127.0.0.1", openBrowserExternal = openBrowser } = {}) {
+async function login({ appUrl, provider = null, outPath = null, host = "127.0.0.1", port = 0, openBrowserExternal = openBrowser } = {}) {
   // 1. auth config
-  const { res: cfgRes } = await rawRequest(`${appUrl}/api/perch-terminal/cli-auth/config`, {
+  const cfgRes = await rawRequest(`${appUrl}/api/perch-terminal/cli-auth/config`, {
     method: "GET",
     headers: { Accept: "application/json" },
     connectTimeoutMs: 10_000,
@@ -103,8 +108,8 @@ async function login({ appUrl, provider = null, outPath = null, host = "127.0.0.
 
   // 2. local callback server + PKCE
   const cbHost = cfg.redirectHost?.trim() || host;
-  const { server, port, codePromise } = await startCallbackServer({ host: cbHost });
-  const redirectTo = `http://${cbHost}:${port}/callback`;
+  const { server, port: callbackPort, codePromise } = await startCallbackServer({ host: cbHost, port });
+  const redirectTo = `http://${cbHost}:${callbackPort}/callback`;
   const { verifier, challenge } = pkcePair();
   const url = authorizeUrl({ supabaseUrl: cfg.supabaseUrl, provider: chosen, redirectTo, challenge });
   log("info", `Opening browser for ${chosen} sign-in...`);
@@ -117,7 +122,7 @@ async function login({ appUrl, provider = null, outPath = null, host = "127.0.0.
   // 3. exchange the code for a session
   const code = await codePromise;
   server.close();
-  const { res: tokRes } = await rawRequest(`${cfg.supabaseUrl}/auth/v1/token?grant_type=pkce`, {
+  const tokRes = await rawRequest(`${cfg.supabaseUrl}/auth/v1/token?grant_type=pkce`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -129,16 +134,16 @@ async function login({ appUrl, provider = null, outPath = null, host = "127.0.0.
     totalTimeoutMs: 15_000,
   });
   const d = await readResBody(tokRes);
-  if (tokRes.statusCode !== 200 || !d?.session?.access_token) {
-    throw new Error(`Token exchange failed (HTTP ${tokRes.statusCode}): ${d?.msg || d?.error_description || JSON.stringify(d).slice(0, 300)}`);
+  const s = d?.session ?? d;
+  if (tokRes.statusCode !== 200 || !s?.access_token) {
+    throw new Error(`Token exchange failed (HTTP ${tokRes.statusCode}): ${d?.msg || d?.error_description || "No access token returned"}`);
   }
-  const s = d.session;
   const session = {
     version: 1,
     appUrl,
     accessToken: s.access_token,
     refreshToken: s.refresh_token ?? null,
-    expiresAt: s.expires_at ?? null,
+    expiresAt: s.expires_at ?? (s.expires_in ? Math.floor(Date.now() / 1000) + s.expires_in : null),
     userId: s.user?.id ?? null,
     email: s.user?.email ?? null,
     updatedAt: new Date().toISOString(),

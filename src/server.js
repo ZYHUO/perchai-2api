@@ -37,12 +37,13 @@ function buildApp(cfg) {
 
   const makeAccount = (a) => {
     a.userAgent = cfg.userAgent;
+    a.loadSessionFile();
     return a;
   };
 
   if (cfg.accounts.length) {
     for (const { key, sessionPath } of cfg.accounts) {
-      const acc = makeAccount(new Account({ appUrl: cfg.appUrl, sessionPath, key }));
+      const acc = accountBySessionPath.get(sessionPath) || makeAccount(new Account({ appUrl: cfg.appUrl, sessionPath, key }));
       accounts.set(key, acc);
       accountBySessionPath.set(sessionPath, acc);
     }
@@ -92,6 +93,7 @@ function buildApp(cfg) {
 
   // ---- helpers ------------------------------------------------------------
   function sendJSON(res, status, obj) {
+    if (res.destroyed || res.writableEnded) return;
     const body = JSON.stringify(obj);
     res.writeHead(status, {
       "Content-Type": "application/json; charset=utf-8",
@@ -140,43 +142,49 @@ function buildApp(cfg) {
     // client disconnect -> abort upstream
     const ac = new AbortController();
     const onClientClose = () => ac.abort();
-    req.on("close", onClientClose);
+    res.once("close", onClientClose);
 
     let attempt;
     try {
-      attempt = await modelCall(account, body, { stream, signal: ac.signal, cfg });
-    } catch (e) {
-      if (e?.name === "AbortError" || req.destroyed) {
-        // client went away or timed out; nothing to write
-        return;
+      try {
+        attempt = await modelCall(account, body, { stream, signal: ac.signal, cfg });
+      } catch (e) {
+        if (ac.signal.aborted || res.destroyed) {
+          // client went away or timed out; nothing to write
+          return;
+        }
+        requestLog(req, res, { account, model: modelName, durationMs: Date.now() - startMs, status: 502 });
+        return sendJSON(res, 502, openAIError(502, e.message || "Upstream request failed", "upstream_error"));
       }
-      requestLog(req, res, { account, model: modelName, durationMs: Date.now() - startMs, status: 502 });
-      return sendJSON(res, 502, openAIError(502, e.message || "Upstream request failed", "upstream_error"));
-    }
-    if (!attempt.auth) {
-      requestLog(req, res, { account, model: modelName, durationMs: Date.now() - startMs, status: 401 });
-      return sendJSON(
-        res,
-        401,
-        openAIError(
+      if (!attempt.auth) {
+        requestLog(req, res, { account, model: modelName, durationMs: Date.now() - startMs, status: 401 });
+        return sendJSON(
+          res,
           401,
-          `No Perch session for account (${account.label}). Log in with \`perchai-2api login\` or the official \`perch\` CLI.`,
-          "not_authenticated",
-        ),
-      );
+          openAIError(
+            401,
+            `No Perch session for account (${account.label}). Log in with \`perchai-2api login\` or the official \`perch\` CLI.`,
+            "not_authenticated",
+          ),
+        );
+      }
+      const { res: upstream, release } = attempt;
+      if (upstream.statusCode >= 400) {
+        const text = (await readStream(upstream).catch(() => Buffer.from(""))).toString("utf8");
+        release();
+        const mapped = upstreamError(upstream.statusCode, text);
+        requestLog(req, res, { account, model: modelName, durationMs: Date.now() - startMs, status: mapped.status });
+        return sendJSON(res, mapped.status, mapped.body);
+      }
+      if (stream) {
+        return await pipeStream(req, res, upstream, body, { key, account, startMs, release });
+      }
+      return await pipeJSON(req, res, upstream, body, { key, account, startMs, release });
+    } finally {
+      attempt?.res?.destroy();
+      attempt?.release?.();
+      res.off("close", onClientClose);
     }
-    const { res: upstream, release } = attempt;
-    if (upstream.statusCode >= 400) {
-      const text = (await readStream(upstream).catch(() => Buffer.from(""))).toString("utf8");
-      release();
-      const mapped = upstreamError(upstream.statusCode, text);
-      requestLog(req, res, { account, model: modelName, durationMs: Date.now() - startMs, status: mapped.status });
-      return sendJSON(res, mapped.status, mapped.body);
-    }
-    if (stream) {
-      return pipeStream(req, res, upstream, body, { key, account, startMs, release });
-    }
-    return pipeJSON(req, res, upstream, body, { key, account, startMs, release });
   }
 
   // non-streaming
@@ -224,18 +232,19 @@ function buildApp(cfg) {
 
     let finalModel = modelName;
     let toolIndex = 0;
+    const tools = new Map();
     let done = null;
     let streamError = null;
     let tokens = null;
-    let finished = false;
 
     const write = async (obj) => {
       if (res.writableEnded || res.destroyed) return false;
       const ok = res.write(`data: ${JSON.stringify(obj)}\n\n`);
       if (!ok) {
         await new Promise((r) => {
-          res.once("drain", r);
-          res.once("close", r);
+          const finish = () => { res.off("drain", finish); res.off("close", finish); r(); };
+          res.once("drain", finish);
+          res.once("close", finish);
         });
       }
       return !res.destroyed;
@@ -251,20 +260,19 @@ function buildApp(cfg) {
       });
     };
 
-    const cleanup = () => {
-      if (finished) return;
-      finished = true;
-      req.off("close", onClientClose);
-      upstream.destroy();
-    };
-    const onClientClose = () => {
-      // client disconnected: stop reading upstream
-      upstream.destroy();
-    };
-
     upstream.setTimeout(cfg.idleTimeoutMs, () => upstream.destroy(new Error("upstream idle timeout")));
+    upstream.setEncoding("utf8");
 
     let buf = "";
+    const emitTool = async (state) => {
+      if (state.emitted) return;
+      state.emitted = true;
+      const tc = state.call;
+      await chunk({ tool_calls: [{ index: state.index, id: tc.id, type: "function", function: {
+        name: tc.name,
+        arguments: typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments ?? {}),
+      } }] });
+    };
     const handlers = {
       onContent: async (text) => {
         if (await chunk({ content: text })) {
@@ -273,26 +281,23 @@ function buildApp(cfg) {
       },
       onReasoning: async (text) => chunk({ reasoning_content: text }),
       onToolCall: async (tc) => {
-        await chunk({
-          tool_calls: [
-            {
-              index: toolIndex++,
-              id: tc.id,
-              type: "function",
-              function: {
-                name: tc.name,
-                arguments: typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments ?? {}),
-              },
-            },
-          ],
-        });
+        let state = tools.get(tc.id);
+        if (!state) { state = { index: toolIndex++, emitted: false }; tools.set(tc.id, state); }
+        state.call = tc;
+        // Perch sends complete snapshots, not append-only argument fragments.
+        // Wait for a sealed snapshot to avoid corrupting or duplicating a call.
+        if (tc.sealed) await emitTool(state);
       },
       onRestart: () => {
-        toolIndex = 0;
+        throw new Error("Upstream restarted the stream; retry the request");
       },
-      onDone: (ev) => {
+      onDone: async (ev) => {
         done = ev;
         if (typeof ev.model === "string") finalModel = ev.model;
+        if (ev.ok !== false) {
+          for (const tc of ev.toolCalls || []) await handlers.onToolCall(tc);
+          for (const state of tools.values()) await emitTool(state);
+        }
       },
       onError: (msg) => {
         streamError = msg;
@@ -306,19 +311,21 @@ function buildApp(cfg) {
         buf = lines.pop() ?? "";
         for (const line of lines) {
           await parsePerchLine(line, handlers);
+          if (done) break;
         }
-        if (res.destroyed) break;
+        if (res.destroyed || done) break;
       }
-      if (buf.trim()) await parsePerchLine(buf, handlers);
+      if (!done && buf.trim()) await parsePerchLine(buf, handlers);
+      if (!done) streamError ||= "Upstream stream ended without a done event";
     } catch (e) {
-      if (req.destroyed || res.destroyed) {
-        cleanup();
+      if (res.destroyed) {
+        upstream.destroy();
         release();
         return; // client is gone; nothing to deliver
       }
       streamError = streamError || e?.message || "Stream interrupted";
     } finally {
-      req.off("close", onClientClose);
+      upstream.destroy();
     }
 
     if (res.destroyed || res.writableEnded) {
@@ -327,7 +334,7 @@ function buildApp(cfg) {
       return;
     }
 
-    if (streamError && (!done || done.ok === false)) {
+    if (streamError) {
       await chunk({}, "error");
       await write({ error: { message: streamError, type: "upstream_error", code: "upstream_error" } });
       tokens = null;
@@ -339,12 +346,12 @@ function buildApp(cfg) {
     } else {
       const usage = includeUsage ? normalizeUsage(done?.usage) : null;
       tokens = usage?.total_tokens ?? null;
-      await chunk({}, done ? finishReasonOf(done) : "stop", usage ? { usage } : {});
+      await chunk({}, done?.finishReason || (tools.size ? "tool_calls" : finishReasonOf(done)), usage ? { usage } : {});
     }
     res.write("data: [DONE]\n\n");
     res.end();
     release();
-    requestLog(req, res, { account, model: finalModel, tokens, durationMs: Date.now() - startMs, status: 200 });
+    if (!streamError && done?.ok !== false) requestLog(req, res, { account, model: finalModel, tokens, durationMs: Date.now() - startMs, status: 200 });
   }
 
   // ---- /v1/embeddings -------------------------------------------------------
@@ -392,7 +399,8 @@ function buildApp(cfg) {
       return sendJSON(res, 200, out);
     } catch (e) {
       requestLog(req, res, { account, durationMs: Date.now() - startMs, status: 502 });
-      return sendJSON(res, 502, openAIError(502, e.message || "Embeddings request failed", "upstream_error"));
+      const status = e.status === 401 ? 401 : 502;
+      return sendJSON(res, status, openAIError(status, e.message || "Embeddings request failed", status === 401 ? "not_authenticated" : "upstream_error"));
     }
   }
 
@@ -401,7 +409,11 @@ function buildApp(cfg) {
     const acc = account || defaultAccount;
     const def = acc && acc.configured ? await defaultModel(acc, { cfg }).catch(() => null) : null;
     const models = [...HOSTED_MODELS];
-    if (def && !models.includes(def)) models.unshift(def);
+    if (def) {
+      const index = models.indexOf(def);
+      if (index >= 0) models.splice(index, 1);
+      models.unshift(def);
+    }
     const data = models.map((id) => ({
       id,
       object: "model",
@@ -426,34 +438,36 @@ function buildApp(cfg) {
       requestLog(req, res, { account, model: "usage", durationMs: Date.now() - startMs, status: 200 });
       return sendJSON(res, 200, json);
     } catch (e) {
-      return sendJSON(res, 502, openAIError(502, e.message || "Usage request failed", "upstream_error"));
+      const status = e.status === 401 ? 401 : 502;
+      return sendJSON(res, status, openAIError(status, e.message || "Usage request failed", status === 401 ? "not_authenticated" : "upstream_error"));
     }
   }
 
   // ---- router -------------------------------------------------------------------
-  const server = http.createServer((req, res) => {
+  const route = async (req, res) => {
     const startMs = Date.now();
-    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    const url = new URL(req.url, "http://localhost");
     const pathname = url.pathname;
 
     if (pathname === "/healthz" || pathname === "/") {
+      const { account } = resolveAccount(req);
+      account?.loadSessionFile();
       return sendJSON(res, 200, {
         ok: true,
         service: "perchai-2api",
         uptimeSec: Math.round(process.uptime()),
-        accounts: accounts.size
-          ? [...accounts.values()].map((a) => ({
-              label: a.label,
-              configured: !!a.session?.accessToken,
-              concurrencyDepth: a.semaphore?.depth ?? 0,
-            }))
-          : [{ label: defaultAccount?.label, configured: !!defaultAccount?.session?.accessToken }],
-        pendingStreams: 0,
+        ...(account ? { accounts: [{
+          label: account.label,
+          configured: !!account.session?.accessToken,
+          activeRequests: account.semaphore?.active ?? 0,
+          concurrencyDepth: account.semaphore?.depth ?? 0,
+        }] } : {}),
       });
     }
 
     if (pathname === "/v1/models" || pathname === "/models") {
       const { key, account } = resolveAccount(req);
+      if (!account) return sendJSON(res, 401, openAIError(401, "Invalid API key", "invalid_api_key"));
       return handleModels(req, res, { key, account }, startMs);
     }
     if (pathname === "/v1/usage" || pathname === "/usage") {
@@ -473,6 +487,13 @@ function buildApp(cfg) {
       return handleEmbeddings(req, res, { key, account }, startMs);
     }
     return sendJSON(res, 404, openAIError(404, "Not found"));
+  };
+  const server = http.createServer((req, res) => {
+    route(req, res).catch((e) => {
+      log("error", `Request failed: ${e.message}`);
+      if (res.headersSent) res.destroy();
+      else sendJSON(res, 500, openAIError(500, "Internal server error"));
+    });
   });
 
   server.on("clientError", (err, socket) => {
@@ -489,7 +510,7 @@ function startServer(cfg = null) {
     log("info", `perchai-2api listening on http://${config.host}:${config.port}`);
     log("info", `backend: ${config.appUrl}`);
     if (config.accounts.length) {
-      log("info", `multi-account mode: ${config.accounts.map((a) => `${a.key} -> ${a.sessionPath}`).join(", ")}`);
+      log("info", `multi-account mode: ${config.accounts.length} client keys configured`);
     } else {
       log("info", `default account: ${config.defaultToken ? "PERCH_MODEL_CALL_PROXY_TOKEN" : config.defaultSessionPath}`);
     }

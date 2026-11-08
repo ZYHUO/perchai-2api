@@ -12,7 +12,7 @@
     "serve": "node bin/perchai-2api.js serve",
     "login": "node bin/perchai-2api.js login",
     "status": "node bin/perchai-2api.js status",
-    "test": "node --test test/"
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=18"

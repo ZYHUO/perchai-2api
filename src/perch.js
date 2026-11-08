@@ -40,7 +40,8 @@ function makePerchBody(openAIRequest, runId) {
 // Single model-call attempt; returns the raw upstream response (stream).
 async function attemptModelCall(account, perchBody, { stream, signal, cfg }) {
   if (!(await account.ensureSession())) return { auth: false };
-  const ticketHeaders = await account.turnTicketHeaders();
+  const ticketHeaders = await account.turnTicketHeaders({ timeoutMs: cfg.ticketTimeoutMs });
+  perchBody.runId = account.ticketRunId || perchBody.runId;
   const headers = {
     "Content-Type": "application/json",
     ...account.authHeaders(),
@@ -54,7 +55,7 @@ async function attemptModelCall(account, perchBody, { stream, signal, cfg }) {
     body: JSON.stringify(perchBody),
     signal,
     connectTimeoutMs: cfg.connectTimeoutMs,
-    totalTimeoutMs: stream ? null : cfg.totalTimeoutMs,
+    totalTimeoutMs: cfg.totalTimeoutMs,
   });
   return { auth: true, res };
 }
@@ -82,8 +83,9 @@ async function modelCall(account, openAIRequest, { stream = false, signal = null
   const release = await account.semaphore.acquire(signal);
   const runId = account.ticketRunId || randomUUID();
   const body = makePerchBody(openAIRequest, runId);
+  let attempt;
   try {
-    let attempt = await attemptModelCall(account, body, { stream, signal, cfg });
+    attempt = await attemptModelCall(account, body, { stream, signal, cfg });
     if (!attempt.auth) {
       release();
       return { auth: false };
@@ -91,41 +93,30 @@ async function modelCall(account, openAIRequest, { stream = false, signal = null
 
     // 401 -> refresh session once and retry
     if (attempt.res.statusCode === 401) {
-      await attempt.res.resume?.();
       if (await account.ensureSession(true)) {
+        attempt.res.destroy();
         attempt = await attemptModelCall(account, body, { stream, signal, cfg });
       }
     }
 
     // transient 5xx -> short backoff retry (only before body starts)
+    if (!attempt.auth) { release(); return { auth: false }; }
     if (RETRYABLE.has(attempt.res.statusCode)) {
-      const retryHeaders = await account.turnTicketHeaders();
+      attempt.res.destroy();
       await sleep(700, signal);
-      const res = await rawRequest(`${account.appUrl}/api/perch-terminal/model-call`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...account.authHeaders(),
-          ...retryHeaders,
-          "x-perch-locale": "en",
-          ...(stream ? { Accept: "text/event-stream" } : {}),
-        },
-        body: JSON.stringify(body),
-        signal,
-        connectTimeoutMs: cfg.connectTimeoutMs,
-        totalTimeoutMs: stream ? null : cfg.totalTimeoutMs,
-      });
-      attempt = { auth: true, res };
+      attempt = await attemptModelCall(account, body, { stream, signal, cfg });
     }
-
+    if (!attempt.auth) { release(); return { auth: false }; }
     return { ...attempt, release };
   } catch (e) {
+    attempt?.res?.destroy();
     release();
     throw e;
   }
 }
 
 async function embeddings(account, input, { dimensions = null, signal = null, cfg } = {}) {
+  if (!(await account.ensureSession())) throw Object.assign(new Error("No Perch session; log in first"), { status: 401 });
   const payload = { input, ...(dimensions ? { dimensions } : {}) };
   let { res, json } = await upstreamJson(`${account.appUrl}/api/perch-terminal/embeddings`, {
     method: "POST",
@@ -149,6 +140,7 @@ async function embeddings(account, input, { dimensions = null, signal = null, cf
 }
 
 async function usageMeter(account, { signal = null, cfg } = {}) {
+  if (!(await account.ensureSession())) throw Object.assign(new Error("No Perch session; log in first"), { status: 401 });
   const dayStart = new Date().toISOString().slice(0, 10);
   const weekStart = new Date(Date.now() - 7 * 86400_000).toISOString().slice(0, 10);
   const { res, json } = await upstreamJson(
@@ -165,6 +157,7 @@ async function usageMeter(account, { signal = null, cfg } = {}) {
 }
 
 async function defaultModel(account, { signal = null, cfg } = {}) {
+  if (!(await account.ensureSession())) return null;
   const { res, json } = await upstreamJson(`${account.appUrl}/api/perch-terminal/public-model-default`, {
     method: "GET",
     headers: { Accept: "application/json", ...account.authHeaders() },

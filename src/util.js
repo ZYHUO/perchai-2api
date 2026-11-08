@@ -41,8 +41,8 @@ function openBrowser(url) {
     try {
       const child = spawn(cmd, args, { stdio: "ignore", detached: true });
       child.on("error", () => resolve(false));
+      child.on("exit", (code) => resolve(code === 0));
       child.unref();
-      resolve(true);
     } catch {
       resolve(false);
     }
@@ -79,6 +79,7 @@ function readJsonBody(req, { limit = 32 * 1024 * 1024 } = {}) {
 // Collect a full body from an IncomingMessage.
 function readStream(stream, { limit = 64 * 1024 * 1024 } = {}) {
   return new Promise((resolve, reject) => {
+    if (stream.destroyed) return reject(stream.errored || new Error("response aborted"));
     const chunks = [];
     let size = 0;
     stream.on("data", (c) => {

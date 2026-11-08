@@ -17,17 +17,19 @@ class Semaphore {
     }
     // FIFO wait
     await new Promise((resolve, reject) => {
-      const entry = { resolve, reject };
-      this.queue.push(entry);
       const onAbort = () => {
         const i = this.queue.indexOf(entry);
         if (i >= 0) this.queue.splice(i, 1);
         reject(new DOMException("Aborted", "AbortError"));
       };
-      entry.abort = onAbort;
+      const entry = { resolve: () => { signal?.removeEventListener("abort", onAbort); resolve(); } };
+      this.queue.push(entry);
       signal?.addEventListener("abort", onAbort, { once: true });
     });
-    this.active += 1;
+    if (signal?.aborted) {
+      this._releaseFn()();
+      throw new DOMException("Aborted", "AbortError");
+    }
     return this._releaseFn();
   }
 
@@ -36,9 +38,9 @@ class Semaphore {
     return () => {
       if (released) return;
       released = true;
-      this.active = Math.max(0, this.active - 1);
       const next = this.queue.shift();
       if (next) next.resolve();
+      else this.active = Math.max(0, this.active - 1);
     };
   }
 

@@ -70,6 +70,7 @@ async function main() {
         appUrl: cfg.appUrl,
         provider: opts.provider,
         outPath,
+        port: Number(process.env.PERCH_LOGIN_PORT || 0),
       });
       fs.mkdirSync(path.dirname(outPath), { recursive: true, mode: 0o700 });
       fs.writeFileSync(outPath, JSON.stringify(session, null, 2), { mode: 0o600 });
@@ -97,11 +98,11 @@ async function main() {
     const exp = acc.session.expiresAt ? new Date(acc.session.expiresAt * 1000).toISOString() : "never (env token)";
     console.log(`app:      ${cfg.appUrl}`);
     console.log(`account:  ${acc.session.email || acc.session.userId || "unknown"}`);
-    console.log(`token:    ${acc.session.accessToken.slice(0, 12)}...`);
+    console.log("token:    configured (redacted)");
     console.log(`expires:  ${exp}`);
     if (cfg.accounts.length) {
       console.log("multi-account keys:");
-      for (const a of cfg.accounts) console.log(`  ${a.key}`);
+      console.log(`  ${cfg.accounts.length} keys configured (redacted)`);
     }
     return;
   }

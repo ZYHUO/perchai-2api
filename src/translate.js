@@ -20,7 +20,7 @@ function normalizeUsage(u) {
 }
 
 function finishReasonOf(perch) {
-  return perch?.finishReason || "stop";
+  return perch?.finishReason || (perch?.toolCalls?.length ? "tool_calls" : "stop");
 }
 
 function toolCallsToOpenAI(toolCalls) {

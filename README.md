@@ -58,7 +58,7 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 | `PERCH_RPM` | `0` | 每 key 每分钟请求数上限（0=关闭） |
 | `PERCH_CONNECT_TIMEOUT_MS` | `10000` | 上游建连超时 |
 | `PERCH_IDLE_TIMEOUT_MS` | `120000` | 流式响应 SSE 事件间隔超时 |
-| `PERCH_TOTAL_TIMEOUT_MS` | `1800000` | 非流式请求总超时 |
+| `PERCH_TOTAL_TIMEOUT_MS` | `1800000` | 每次上游模型调用超时（含流式响应体） |
 | `PERCH_LOG_LEVEL` | `1` | `0`=安静 `1`=请求日志 `2`=调试 |
 
 ## 端点
@@ -94,7 +94,7 @@ Perch 托管：`gpt-6.1-sol`、`gpt-6.1-terra`、`gpt-6-astra`、`gpt-6-sol`、`
 ## 测试
 
 ```bash
-npm test     # 16 个用例：mock 上游端到端（流式/工具/错误映射/并发上限/多账户/限流/向量/用量）
+npm test     # 35 个用例：mock 上游端到端、登录、超时、取消、流式、并发与鉴权回归
 ```
 
 ## Docker
@@ -129,3 +129,64 @@ test/
 - turn-ticket 获取失败时降级为不带票据调用，不阻塞请求。
 - 仅供个人使用，未内置 TLS；公网部署请自行加反向代理与访问控制。
 - 本项目只包装你自己的 Perch 账号，不涉及任何第三方账户凭证的绕过。
+
+## Docker Compose 部署与修复说明
+
+在项目目录先初始化配置和会话目录。以下命令仅用于首次部署，已有 `.env` 时不要覆盖：
+
+```bash
+umask 077
+mkdir -p data
+printf 'PERCH_2API_KEY=sk-perch-%s\nPERCH_MAX_CONCURRENCY=4\nPERCH_RPM=60\nPERCH_LOG_LEVEL=1\n' "$(openssl rand -hex 24)" > .env
+# Compose 中服务以 UID/GID 1000:1000 运行，确保会话目录可写
+sudo chown 1000:1000 data
+docker-compose up -d --build
+```
+
+如果使用 Docker Compose v2，将下文 `docker-compose` 换成 `docker compose`。
+
+- API Base URL：`http://127.0.0.1:8080/v1`。
+- 容器：`perchai-2api`，`restart: unless-stopped`，非 root 用户运行。
+- 客户端密钥保存在 `.env` 的 `PERCH_2API_KEY`，文件权限为 `600`。不要将该文件提交到版本库。
+- 会话目录：`data/`，容器内为 `/data`；会话文件为 `data/cli-auth-session.json`。
+- 已设置每分钟 60 次聊天请求、每账号 4 个上游并发，以及日志轮转。
+- `/healthz` 表示服务进程存活。带正确 API Key 请求时才返回当前账号会话及队列状态；进程健康不代表已经登录。
+
+管理命令（在项目目录执行）：
+
+```bash
+docker-compose up -d --build
+docker-compose ps
+docker-compose logs --tail=100 -f
+docker-compose restart
+curl http://127.0.0.1:8080/healthz
+```
+
+之后登录：
+
+```bash
+./bin/login-docker.sh
+# 可选 GitHub 登录：./bin/login-docker.sh --provider github
+docker-compose restart
+```
+
+命令会输出浏览器登录链接，回调地址固定为 `127.0.0.1:18081`。如果浏览器在另一台电脑，在那台电脑先运行 `ssh -N -L 18081:127.0.0.1:18081 用户名@服务器地址`，保持隧道开启，再打开登录链接。登录脚本使用容器内的 Node，无需在宿主机安装 Node。
+
+通过 SSH 从其他电脑调用 API，可以另开 `ssh -N -L 8080:127.0.0.1:8080 用户名@服务器地址`，然后使用本机 `http://127.0.0.1:8080/v1` 和 `.env` 中的 Key。
+
+本次检查修复了以下问题，并补充了回归测试：
+
+1. `npm test` 在 Node 22 下将测试目录当作入口模块，导致无法运行。
+2. 内置登录错误解构 HTTP 响应、读取错误的 Supabase 令牌字段；无桌面浏览器时可能不输出登录链接；无关回调请求会中断登录。
+3. 上游连接错误时请求挂起；客户端断开不能及时取消上游；总超时在收到响应头后失效；重试未释放旧连接。
+4. 中文跨网络分块时乱码；重复工具调用快照变成多个调用；缺失完成事件被误报为正常结束。
+5. 用量和向量接口首次请求未加载会话；模型列表未校验客户端密钥；健康检查泄露账号路径；多账号启动日志包含完整 API Key。
+6. 并发信号量交接存在超额并发窗口；相同会话的多个 Key 未共享并发限制；新 turn-ticket 的 runId 未用于首次模型请求。
+
+35 个测试使用本地 mock 上游，涵盖正常聊天、SSE、工具调用、错误、取消、超时、并发、登录换码、账号路由和鉴权。可复现命令：
+
+```bash
+docker run --rm -v "$PWD:/app:ro" -w /app node:22-alpine npm test
+```
+
+这组测试没有使用真实 Perch 账号。部署后需要登录并验证真实账号的聊天、工具、向量、用量和令牌刷新。`/v1/models` 的候选列表为代码内置列表，不代表账号有权使用全部模型。流式工具参数按 Perch 快照处理，在工具封口或完成事件时输出；上游协议变化仍需要真实账号验证。

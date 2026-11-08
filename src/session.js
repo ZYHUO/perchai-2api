@@ -23,15 +23,24 @@ function setMaxSockets(n) {
 // Supports: keep-alive, connect timeout, overall timeout, external abort signal.
 function rawRequest(url, { method = "GET", headers = {}, body = null, signal = null, connectTimeoutMs = 10_000, totalTimeoutMs = null } = {}) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
     const u = new URL(url);
     const lib = u.protocol === "https:" ? https : http;
-    let done = false;
-    const finish = (fn, arg) => {
-      if (done) return;
-      done = true;
-      cleanup();
-      fn(arg);
+    let response = null;
+    let totalTimer = null;
+    let connectTimer = null;
+    const cleanup = () => {
+      clearTimeout(totalTimer);
+      clearTimeout(connectTimer);
+      signal?.removeEventListener("abort", onAbort);
     };
+    const fail = (error) => {
+      cleanup();
+      response?.destroy(error);
+      req.destroy(error);
+      reject(error);
+    };
+    const onAbort = () => fail(new DOMException("Aborted", "AbortError"));
     const req = lib.request(
       u,
       {
@@ -39,28 +48,34 @@ function rawRequest(url, { method = "GET", headers = {}, body = null, signal = n
         headers: { ...headers },
         agent: u.protocol === "https:" ? agents.https : agents.http,
       },
-      (res) => finish(resolve, res),
+      (res) => {
+        response = res;
+        clearTimeout(connectTimer);
+        // The request promise settles at headers; cancellation and the deadline
+        // must survive until the response body has finished.
+        res.once("end", cleanup);
+        res.once("close", cleanup);
+        // A retry may be refreshing credentials before it attaches a body
+        // reader. Keep a cancellation in that interval from crashing Node.
+        res.on("error", () => {});
+        resolve(res);
+      },
     );
-    const onAbort = () => {
-      req.destroy(new DOMException("Aborted", "AbortError"));
-      finish(reject, new DOMException("Aborted", "AbortError"));
-    };
-    let totalTimer = null;
-    const cleanup = () => {
-      clearTimeout(totalTimer);
-      signal?.removeEventListener("abort", onAbort);
-    };
-    req.on("error", (e) => finish(reject, e));
-    req.setTimeout(connectTimeoutMs, () => {
-      req.destroy(new Error(`connect timeout after ${connectTimeoutMs}ms`));
+    req.on("error", (e) => { cleanup(); response?.destroy(e); reject(e); });
+    connectTimer = setTimeout(() => fail(new Error(`connect timeout after ${connectTimeoutMs}ms`)), connectTimeoutMs);
+    connectTimer.unref?.();
+    req.once("socket", (socket) => {
+      if (!socket.connecting) clearTimeout(connectTimer);
+      else socket.once(u.protocol === "https:" ? "secureConnect" : "connect", () => clearTimeout(connectTimer));
     });
     if (totalTimeoutMs) {
       totalTimer = setTimeout(() => {
-        req.destroy(new Error(`total timeout after ${totalTimeoutMs}ms`));
+        fail(new Error(`total timeout after ${totalTimeoutMs}ms`));
       }, totalTimeoutMs);
       totalTimer.unref?.();
     }
     signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) { onAbort(); return; }
     if (body != null) req.write(body);
     req.end();
   });
@@ -74,6 +89,7 @@ async function upstreamJson(url, opts = {}) {
 
 function readResBody(res, { limit = 64 * 1024 * 1024 } = {}) {
   return new Promise((resolve, reject) => {
+    if (res.destroyed) return reject(res.errored || new Error("response aborted"));
     const chunks = [];
     let size = 0;
     res.on("data", (c) => {
@@ -94,6 +110,7 @@ function readResBody(res, { limit = 64 * 1024 * 1024 } = {}) {
       }
     });
     res.on("error", reject);
+    res.on("aborted", () => reject(new Error("response aborted")));
   });
 }
 
@@ -180,6 +197,7 @@ class Account {
           Authorization: `Bearer ${cfg.supabaseAnonKey}`,
         },
         body: JSON.stringify({ refresh_token: this.session.refreshToken }),
+        totalTimeoutMs: 15_000,
       });
       if (res.statusCode !== 200) return false;
       const d = json;
@@ -188,7 +206,7 @@ class Account {
         ...this.session,
         accessToken: d.access_token,
         refreshToken: d.refresh_token ?? this.session.refreshToken,
-        expiresAt: d.expires_at ?? this.session.expiresAt,
+        expiresAt: d.expires_at ?? (d.expires_in ? now() + d.expires_in : this.session.expiresAt),
         userId: d.user?.id ?? this.session.userId,
         email: d.user?.email ?? this.session.email,
       };
@@ -217,17 +235,17 @@ class Account {
   }
 
   // Turn ticket: best-effort, cached, auto-renewed. Returns headers or {}.
-  async turnTicketHeaders() {
+  async turnTicketHeaders({ timeoutMs = 8000 } = {}) {
     try {
       if (this.ticket && this.ticket.expiresAt > Date.now() + 30_000) {
         return { "x-perch-turn-ticket": this.ticket.token };
       }
       if (this.ticket && this.ticket.expiresAt > Date.now() && this.ticket.renewal && !this.ticketPromise) {
-        this.ticketPromise = this.fetchTicket(this.ticket.renewal).then((t) => (this.ticket = t)).finally(() => (this.ticketPromise = null));
+        this.ticketPromise = this.fetchTicket(this.ticket.renewal, { timeoutMs }).then((t) => (this.ticket = t)).catch(() => null).finally(() => (this.ticketPromise = null));
         return { "x-perch-turn-ticket": this.ticket.token };
       }
       if (!this.ticketPromise) {
-        this.ticketPromise = this.fetchTicket().then((t) => (this.ticket = t)).finally(() => (this.ticketPromise = null));
+        this.ticketPromise = this.fetchTicket(null, { timeoutMs }).then((t) => (this.ticket = t)).finally(() => (this.ticketPromise = null));
       }
       await this.ticketPromise;
       if (!this.ticket || this.ticket.expiresAt <= Date.now() + 30_000) return {};
@@ -251,7 +269,7 @@ class Account {
       connectTimeoutMs: timeoutMs,
       totalTimeoutMs: timeoutMs,
     });
-    if (res.statusCode === 429 || res.statusCode >= 400) return null;
+    if (res.statusCode >= 400) { res.destroy(); return null; }
     const d = await readResBody(res);
     if (!d?.ok || !d.ticket || !d.ticketId || !d.runId) return null;
     const expiresAt = d.expiresAt ? Date.parse(d.expiresAt) : Date.now() + 300_000;
@@ -260,7 +278,7 @@ class Account {
       ticketId: d.ticketId,
       runId: d.runId,
       expiresAt: Number.isFinite(expiresAt) ? expiresAt : Date.now() + 300_000,
-      renewal,
+      renewal: { ticketId: d.ticketId },
       enforced: d.enforced === true,
     };
   }
